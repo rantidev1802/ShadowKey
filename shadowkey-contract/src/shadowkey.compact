@@ -1,0 +1,202 @@
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// ── Data Structures ──
+
+struct IdentityCommit {
+  nameHash: Bytes<32>;
+  dobHash: Bytes<32>;
+  nationalityHash: Bytes<32>;
+  addressHash: Bytes<32>;
+  idNumberHash: Bytes<32>;
+}
+
+struct DocumentRecord {
+  docHash: Bytes<32>;
+  docType: Field;
+}
+
+struct VerificationRecord {
+  identityId: Bytes<32>;
+  verifiedAt: Field;
+  expiresAt: Field;
+}
+
+// ── Public Ledger State ──
+
+export ledger identityCommits: Map<Bytes<32>, IdentityCommit>;
+export ledger identityStatuses: Map<Bytes<32>, Field>;
+// 0=not_registered  1=pending_review  2=verified  3=rejected  4=deleted
+
+export ledger documentCommits: Map<Bytes<32>, DocumentRecord>;
+
+export ledger verifiedIdentities: Map<Bytes<32>, Boolean>;
+export ledger verificationRecords: Map<Bytes<32>, VerificationRecord>;
+export ledger deletedIdentities: Map<Bytes<32>, Boolean>;
+export ledger activeSessions: Map<Bytes<32>, Boolean>;
+export ledger totalRegistered: Counter;
+export ledger totalVerified: Counter;
+
+// ── Witnesses ──
+
+witness getIdentitySecret(): Bytes<32>;
+witness getCurrentBlock(): Field;
+
+// ── Helpers ──
+
+circuit hashField(input: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "shadowkey:field:v1"),
+    input
+  ]);
+}
+
+circuit hashDocument(input: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "shadowkey:doc:v1"),
+    input
+  ]);
+}
+
+circuit deriveIdentityId(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "shadowkey:identity:v1"),
+    secret
+  ]);
+}
+
+// ── Circuit: Submit Identity ──
+export circuit submitIdentity(
+  nameRaw: Bytes<32>,
+  dobRaw: Bytes<32>,
+  nationalityRaw: Bytes<32>,
+  addressRaw: Bytes<32>,
+  idNumberRaw: Bytes<32>
+): [] {
+  const identityId = deriveIdentityId(getIdentitySecret());
+  const disclosedId = disclose(identityId);
+
+  assert(deletedIdentities.lookup(disclosedId) != true, "Deleted.");
+
+  identityCommits.insert(disclosedId, IdentityCommit {
+    nameHash: disclose(hashField(nameRaw)),
+    dobHash: disclose(hashField(dobRaw)),
+    nationalityHash: disclose(hashField(nationalityRaw)),
+    addressHash: disclose(hashField(addressRaw)),
+    idNumberHash: disclose(hashField(idNumberRaw))
+  });
+
+  identityStatuses.insert(disclosedId, 1);
+  totalRegistered.increment(1);
+}
+
+// ── Circuit: Upload Document ──
+export circuit uploadDocument(
+  docRaw: Bytes<32>,
+  docType: Field
+): [] {
+  const identityId = deriveIdentityId(getIdentitySecret());
+  const disclosedId = disclose(identityId);
+
+  assert(deletedIdentities.lookup(disclosedId) != true, "Deleted.");
+
+  const docId = persistentHash<Vector<2, Bytes<32>>>([
+    disclose(identityId),
+    hashDocument(docRaw)
+  ]);
+  const disclosedDocId = disclose(docId);
+
+  documentCommits.insert(disclosedDocId, DocumentRecord {
+    docHash: disclose(hashDocument(docRaw)),
+    docType: disclose(docType)
+  });
+}
+
+// ── Circuit: Approve Identity ──
+export circuit approveIdentity(
+  identityId: Bytes<32>
+): [] {
+  const disclosedId = disclose(identityId);
+  assert(deletedIdentities.lookup(disclosedId) != true, "Deleted.");
+
+  identityStatuses.insert(disclosedId, 2);
+  verifiedIdentities.insert(disclosedId, true);
+  totalVerified.increment(1);
+}
+
+// ── Circuit: Reject Identity ──
+export circuit rejectIdentity(
+  identityId: Bytes<32>
+): [] {
+  const disclosedId = disclose(identityId);
+  identityStatuses.insert(disclosedId, 3);
+}
+
+// ── Circuit: Delete Identity (Privacy Erasure) ──
+export circuit deleteIdentity(
+  identityId: Bytes<32>
+): [] {
+  const disclosedId = disclose(identityId);
+  assert(verifiedIdentities.lookup(disclosedId) == true, "Not verified.");
+
+  identityCommits.remove(disclosedId);
+  identityStatuses.remove(disclosedId);
+  verifiedIdentities.remove(disclosedId);
+  verificationRecords.remove(disclosedId);
+  deletedIdentities.insert(disclosedId, true);
+}
+
+// ── Circuit: Prove Identity Exists ──
+export circuit proveIdentityExists(identityId: Bytes<32>): Boolean {
+  const disclosedId = disclose(identityId);
+  assert(deletedIdentities.lookup(disclosedId) != true, "Deleted.");
+  return verifiedIdentities.lookup(disclosedId);
+}
+
+// ── Circuit: Prove Field Match ──
+export circuit proveField(
+  identityId: Bytes<32>,
+  fieldValue: Bytes<32>
+): Boolean {
+  const disclosedId = disclose(identityId);
+  assert(verifiedIdentities.lookup(disclosedId) == true, "Not verified.");
+  assert(deletedIdentities.lookup(disclosedId) != true, "Deleted.");
+
+  const commit = identityCommits.lookup(disclosedId);
+  const actualHash = hashField(fieldValue);
+
+  return verifyFieldMatch(commit, actualHash);
+}
+
+// ── Circuit: Verify Field Match (ZK helper) ──
+circuit verifyFieldMatch(
+  commit: IdentityCommit,
+  hash: Bytes<32>
+): Boolean {
+  return commit.nameHash == hash;
+}
+
+// ── Circuit: Login (Authenticate) ──
+export circuit login(): Bytes<32> {
+  const identityId = deriveIdentityId(getIdentitySecret());
+  const disclosedId = disclose(identityId);
+
+  assert(verifiedIdentities.lookup(disclosedId) == true, "Not verified.");
+  assert(deletedIdentities.lookup(disclosedId) != true, "Deleted.");
+
+  const nonce = persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "shadowkey:session:v1"),
+    identityId
+  ]);
+  const disclosedNonce = disclose(nonce);
+  activeSessions.insert(disclosedNonce, true);
+
+  return disclose(nonce);
+}
+
+// ── Circuit: Verify Session ──
+export circuit verifySession(nonce: Bytes<32>): Boolean {
+  const disclosedNonce = disclose(nonce);
+  return activeSessions.lookup(disclosedNonce) == true;
+}
